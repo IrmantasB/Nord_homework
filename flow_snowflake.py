@@ -1,30 +1,23 @@
 import logging
-import pandas as pd
+#import pandas as pd
 from datetime import datetime, timedelta
 from pytrends.request import TrendReq
 from prefect import task, flow, serve
-#from prefect_snowflake.database import SnowflakeConnector
-#from sqlalchemy import create_engine
 from snowflake_config import SNOWFLAKE_CONFIG  # Importing the Snowflake connection parameters
 import snowflake.connector as snow
 from snowflake.connector.pandas_tools import write_pandas
- 
 
-@task
+@task # Each task is defined as a separate block
 def fetch_google_trends_data(keywords, timeframe='now 7-d', geo=''):
     pytrends = TrendReq(hl='en-US', tz=0)
     pytrends.build_payload(keywords, cat=0, timeframe=timeframe, geo=geo)
-    interest_by_country_df = pytrends.interest_by_region(resolution='COUNTRY', inc_low_vol=True, inc_geo_code=True)
+    interest_by_country_df = pytrends.interest_by_region(resolution='COUNTRY', inc_low_vol=True, inc_geo_code=True).reset_index()
 
     # Rename columns
-    interest_by_country_df = interest_by_country_df.rename(columns={'geoName': 'Country'})
-    interest_by_country_df = interest_by_country_df.rename(columns={'geoCode': 'CountryCode'})
-    interest_by_country_df = interest_by_country_df.rename(columns={'vpn': 'VPN'})
-    interest_by_country_df = interest_by_country_df.rename(columns={'hack': 'Hack'})
-    interest_by_country_df = interest_by_country_df.rename(columns={'cyber': 'Cyber'})
-    interest_by_country_df = interest_by_country_df.rename(columns={'security': 'Security'})
-    interest_by_country_df = interest_by_country_df.rename(columns={'wifi': 'WiFi'})
-    
+    interest_by_country_df = interest_by_country_df.rename(columns={'geoName': 'Country', 'geoCode': 'CountryCode', 
+                                                                  'vpn': 'VPN', 'hack': 'Hack', 'cyber': 'Cyber', 
+                                                                  'security': 'Security', 'wifi': 'WiFi'})
+
     # Set the data extraction date for each country
     end_date = datetime.now().date().strftime('%Y-%m-%d')
     interest_by_country_df['DateExtracted'] = end_date
@@ -36,15 +29,20 @@ def fetch_google_trends_data(keywords, timeframe='now 7-d', geo=''):
 
     # Set the end date for each country
     interest_by_country_df['EndDate'] = end_date
-      
+  
+    # Export the DataFrame to a CSV file
+    csv_file_path = 'interest_by_country.csv'
+    interest_by_country_df.to_csv(csv_file_path, index=False)
+    
     return interest_by_country_df
 
 @task
 def rank_columns(data):
+    logging.info("Ranking columns...")
     processed_data = data.copy()
 
     # Define the columns to be ranked
-    columns_to_rank = ['vpn', 'hack', 'cyber', 'security', 'wifi']
+    columns_to_rank = ['VPN', 'Hack', 'Cyber', 'Security', 'WiFi']
     
     # Loop through each row (country) in the DataFrame
     for index, row in processed_data.iterrows():
@@ -58,16 +56,16 @@ def rank_columns(data):
         # Assign ranks to each column
         ranks = {column: rank+1 for rank, (column, value) in enumerate(sorted_values)}
         
-        # Check if 'vpn' is equal to at least one other column
-        equal_values = [column for column in columns_to_rank if column in values and values['vpn'] == values[column]]
+        # Check if 'VPN' is equal to at least one other column
+        equal_values = [column for column in columns_to_rank if column in values and values['VPN'] == values[column]]
         
         if len(equal_values) >= 2:
-            # If 'vpn' is equal to at least one other column, put 'vpn' last among them
-            vpn_rank = max(ranks[column] for column in equal_values)
+            # If 'VPN' is equal to at least one other column, put 'VPN' last among them
+            VPN_rank = max(ranks[column] for column in equal_values)
             for column in equal_values:
-                if column != 'vpn':
-                    ranks[column] = min(ranks[column], vpn_rank - 1)
-                ranks['vpn'] = vpn_rank
+                if column != 'VPN':
+                    ranks[column] = min(ranks[column], VPN_rank - 1)
+                ranks['VPN'] = VPN_rank
         
         # Update the DataFrame with the ranks
         for column in columns_to_rank:
@@ -78,53 +76,46 @@ def rank_columns(data):
 
 @task
 def transpose_data(data):
+    logging.info("Transposing columns...")
     processed_data = data.copy()
+
+    # Define the columns to be transposed
+    columns_to_transpose = ['VPN', 'Hack', 'Cyber', 'Security', 'WiFi']
     
-    # Get list of all available columns
-    original_columns = processed_data.columns.tolist()
+    # Melt the DataFrame to transpose the columns
+    melted_df = processed_data.melt(id_vars=[col for col in processed_data.columns if col not in columns_to_transpose], 
+                                    value_vars=columns_to_transpose, var_name='Keyword', value_name='Ranking')
+
+    # Sort the melted DataFrame by 'Country' and 'Ranking'
+    melted_df = melted_df.sort_values(by=['Country', 'Ranking'], ascending=[True, False])
+
+    melted_df = melted_df[['Country', 'CountryCode', 'Keyword', 'Ranking', 'StartDate', 'EndDate', 'DateExtracted']]
+    # Reset the index of the melted DataFrame
+    melted_df = melted_df.reset_index(drop=True)
     
-    # Initialize a list to store the transposed data
-    transposed_data = []
-
-    # Loop through each row (country) in the DataFrame
-    for _, row in processed_data.iterrows():
-
-        # Extract additional columns
-        country = row['Country']
-        country_code = row['CountryCode']
-        start_date = row['StartDate']
-        end_date = row['EndDate']
-        date_extracted = row['DateExtracted']
-
-        # Append the transposed data for the current country
-        for keyword in original_columns:
-            if keyword in processed_data.columns:
-                transposed_data.append([country, country_code, keyword, row[keyword], start_date, end_date, date_extracted])
-
-    # Create a DataFrame from the transposed data
-    transposed_df = pd.DataFrame(transposed_data, columns=['Country', 'CountryCode', 'Keywords', 'Rank', 'StartDate', 'EndDate', 'DateExtracted'])
-
-    return transposed_df
+    return melted_df
 
 @task
 def store_data_in_snowflake(data):
-    print("Storing data in Snowflake...")
+    logging.info("Storing data in Snowflake...")
     try:
         # Using the imported connection parameters
         conn = snow.connect(**SNOWFLAKE_CONFIG)  
-        # Dataframe
-        df = pd.DataFrame(data)
-        # Write data from dataframe
-        write_pandas(conn, df, "IB_google_trends_data", auto_create_table=True)
-        # Close connection
-        conn.close()
-        # Loggs will be outputed in terminal
+
+        # Reset the DataFrame's index (excluding the index column)        
+        data = data.reset_index(drop=True)
+
+        # Write data from dataframe        
+        write_pandas(conn, data, "IB_google_trends_data", auto_create_table=True)
+
+        # Logs will be outputted in terminal
         logging.info("Data stored in Snowflake successfully.")
-        return 'Data stored in Snowflake table IB_staging_trends_data'
+        return 'Data stored in Snowflake table IB_google_trends_data'
     except Exception as e:
         logging.error(f"An error occurred while storing data in Snowflake: {e}")
-        return None
-    
+
+        # Close connection
+        conn.close()
 
 @flow
 def homework_data_flow():
@@ -132,15 +123,15 @@ def homework_data_flow():
     # Fetch Google Trends data
     interest_by_country_data = fetch_google_trends_data(['vpn', 'hack', 'cyber', 'security', 'wifi'])
 
-    # Rank columns. Simple ranking, each keyword as sepparate column
+    # Rank columns. Simple ranking, each keyword as sepparate column and VPN last among those that are equal value (the rest ranked alphabetically among them)
     ranked_data = rank_columns(interest_by_country_data)
 
-    # Keywords and their values transposed for better analytical capabilities
+    #Transpose columns.
     transposed_data = transpose_data(ranked_data)
 
     # Store prod data in BigQuery
     store_data_in_snowflake(transposed_data)
-    
+        
 # Run the flow
 if __name__ == "__main__":
     deploy = homework_data_flow.to_deployment(name="homework_deployment", interval=120)
